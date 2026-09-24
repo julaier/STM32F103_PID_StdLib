@@ -10,8 +10,8 @@
 #define ENCODER_RIGHT_SIGN            -1
 /* TIM 编码器输入滤波，范围 0x0 到 0xF；数值越大滤波越强。 */
 #define ENCODER_IC_FILTER             0x0FU
-#define MOTOR_LEFT_FORWARD_INVERT     0U
-#define MOTOR_RIGHT_FORWARD_INVERT    0U
+#define MOTOR_LEFT_FORWARD_INVERT     1U
+#define MOTOR_RIGHT_FORWARD_INVERT    1U
 
 /* PID 输出的 PWM 范围是 -MOTOR_MAX_DUTY 到 +MOTOR_MAX_DUTY。 */
 #define MOTOR_MAX_DUTY                1000U
@@ -26,9 +26,9 @@
 
 /* 左右轮速度环初始 PID 参数。第一次调参时 Ki 和 Kd 保持 0。
    这里的初值取得比较保守，按 Kp -> Ki -> Kd 的顺序一点点加。 */
-#define WHEEL_PID_KP                  2.00f
-#define WHEEL_PID_KI                  0.30f
-#define WHEEL_PID_KD                  0.00f
+#define WHEEL_PID_KP                  0.80f
+#define WHEEL_PID_KI                  0.32f
+#define WHEEL_PID_KD                  0.01f
 /* 速度环输出限幅，对应电机 PWM -1000 到 +1000。 */
 #define WHEEL_PID_OUTPUT_MIN         -1000.0f
 #define WHEEL_PID_OUTPUT_MAX          1000.0f
@@ -42,6 +42,17 @@
 /* 允许设置的最大、最小目标速度，单位是 encoder counts/s。 */
 #define WHEEL_SPEED_MIN              -3000.0f
 #define WHEEL_SPEED_MAX               3000.0f
+
+/* 角度外环 PID：输入是角度误差（度），输出是原地转弯速度差（counts/s）。
+   先只调 Kp，Ki 和 Kd 先保持 0；输出会送到左右轮速度环。 */
+#define ANGLE_PID_KP                  8.00f
+#define ANGLE_PID_KI                  0.00f
+#define ANGLE_PID_KD                  2.00f
+#define ANGLE_PID_OUTPUT_MIN         -1000.0f
+#define ANGLE_PID_OUTPUT_MAX          1000.0f
+#define ANGLE_PID_INTEGRAL_MIN       -300.0f
+#define ANGLE_PID_INTEGRAL_MAX        300.0f
+#define ANGLE_PID_INTEGRAL_SEPARATION_RATIO 0.80f
 
 /* 循迹位置环 PID。输入误差范围是 -3 到 +3。 */
 #define LINE_PID_KP                   120.0f

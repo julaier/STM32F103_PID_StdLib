@@ -14,8 +14,9 @@
      4 = 循迹原始值测试
      5 = 完整循迹
      6 = 90 度转弯脉冲测试
-     7 = MPU6050 陀螺仪 Z 轴测试 */
-#define ROBOT_TEST_MODE              6U
+     7 = MPU6050 陀螺仪 Z 轴测试
+     8 = 陀螺仪固定角度双环转弯 */
+#define ROBOT_TEST_MODE              8U
 /* 模式 3 的左右轮目标速度，单位是 encoder counts/s。 */
 #define WHEEL_TEST_TARGET_COUNTS_S   2000.0f
 /* 模式 2 的开环 PWM 命令，建议先从 200 开始。 */
@@ -39,8 +40,34 @@
    校准时小车必须保持静止，500 次乘 2 ms 约需要 1 秒。 */
 #define GYRO_TEST_CALIBRATION_SAMPLES 500U
 #define GYRO_TEST_CALIBRATION_DELAY_MS 2U
-/* 模式 7 每个循环读取一次，主循环后面的延时也是 10 ms。 */
-#define GYRO_TEST_DT_S                 0.01f
+/* 模式 7 使用 TIM1 测量每个循环的真实时间，避免固定 10 ms 造成少算。 */
+
+/* 模式 8：固定角度双环转弯。 */
+/* 目标角度，正数左转，负数右转；先测 90 度就填 90.0f。 */
+#define ANGLE_TEST_TARGET_DEG         90.0f
+/* 陀螺仪安装方向修正：左转时 yaw 为正就填 1，右转时 yaw 为正就填 -1。 */
+#define ANGLE_TEST_GYRO_SIGN          1.0f
+/* 初始方向接反时，反向转过 20 度后自动翻转一次陀螺仪符号。 */
+#define ANGLE_TEST_SIGN_FIX_DEG       20.0f
+/* 只在上电转弯开始后的前 1 秒内检查符号，避免正常过冲时误翻转。 */
+#define ANGLE_TEST_SIGN_CHECK_MS      1000U
+/* 超过目标角度这么多还未停下，判定控制异常并立即停车。 */
+#define ANGLE_TEST_MAX_OVERSHOOT_DEG  10.0f
+/* 电机转弯方向修正：正转弯速度让小车左转就填 1，否则填 -1。 */
+#define ANGLE_TEST_STEERING_SIGN      1.0f
+/* 两轮都正转时使用的基准速度和最小轮速，单位 counts/s。 */
+#define ANGLE_TEST_BASE_COUNTS_S      800.0f
+#define ANGLE_TEST_MIN_WHEEL_COUNTS_S 500.0f
+/* 角度环输出的是左右轮速度差，差值的最大绝对值不能超过基准值减最小轮速。 */
+#define ANGLE_TEST_MAX_DIFF_COUNTS_S  (ANGLE_TEST_BASE_COUNTS_S - ANGLE_TEST_MIN_WHEEL_COUNTS_S)
+/* 上电后等待时间，先把小车摆好并保持静止。 */
+#define ANGLE_TEST_START_DELAY_MS     3000U
+/* 最长转弯时间，防止测不到目标角度时一直转。 */
+#define ANGLE_TEST_MAX_MS             7000U
+/* 角度误差进入这个范围且转速足够低，连续几个周期后认为到达。 */
+#define ANGLE_TEST_TOLERANCE_DEG      2.0f
+#define ANGLE_TEST_STOP_RATE_DPS      20.0f
+#define ANGLE_TEST_SETTLE_COUNT       3U
 
 static Robot_t g_robot;
 static uint32_t g_loop_count;
@@ -64,13 +91,37 @@ static int32_t g_turn_diff_left;
 static int32_t g_turn_diff_right;
 #endif
 
-#if (ROBOT_TEST_MODE == 7U)
-/* 模式 7 保存最近一次陀螺仪读数、零偏和积分角度。 */
+#if ((ROBOT_TEST_MODE == 7U) || (ROBOT_TEST_MODE == 8U))
+/* 模式 7/8 保存最近一次陀螺仪读数、零偏和积分角度。 */
 static int16_t g_gyro_raw_z;
 static float g_gyro_bias_z_raw;
 static float g_gyro_rate_z_dps;
 static float g_gyro_angle_z_deg;
 static uint8_t g_gyro_read_ok;
+static uint16_t g_gyro_last_us;
+#endif
+
+#if (ROBOT_TEST_MODE == 8U)
+/* 模式 8 状态：等待启动、角度控制中、完成。 */
+#define ANGLE8_STATE_WAIT_START     0U
+#define ANGLE8_STATE_TURNING        1U
+#define ANGLE8_STATE_DONE           2U
+
+static PID_t g_angle_pid;
+static uint8_t g_angle_state;
+static uint32_t g_angle_elapsed_ms;
+static uint8_t g_angle_settle_count;
+static uint8_t g_angle_timeout;
+static int32_t g_angle_start_left;
+static int32_t g_angle_start_right;
+static int32_t g_angle_end_left;
+static int32_t g_angle_end_right;
+static int32_t g_angle_diff_left;
+static int32_t g_angle_diff_right;
+static float g_angle_error_deg;
+static float g_angle_output_counts_s;
+static float g_angle_gyro_sign;
+static uint8_t g_angle_sign_corrected;
 #endif
 
 /* 简单的阻塞式串口打印函数，只用于测试和调参。 */
@@ -120,6 +171,33 @@ static void Turn6_Finish(uint8_t timed_out)
 }
 #endif
 
+#if (ROBOT_TEST_MODE == 8U)
+static float Angle8_Abs(float value)
+{
+  return (value < 0.0f) ? -value : value;
+}
+
+static void Angle8_Finish(uint8_t timed_out)
+{
+  int32_t end_left;
+  int32_t end_right;
+
+  Robot_Stop(&g_robot);
+  Motor_Brake(&g_robot.left_motor);
+  Motor_Brake(&g_robot.right_motor);
+  Robot_UpdateEncoders(&g_robot, ROBOT_CONTROL_PERIOD_MS);
+
+  end_left = Encoder_GetTotal(&g_robot.left_encoder);
+  end_right = Encoder_GetTotal(&g_robot.right_encoder);
+  g_angle_end_left = end_left;
+  g_angle_end_right = end_right;
+  g_angle_diff_left = end_left - g_angle_start_left;
+  g_angle_diff_right = end_right - g_angle_start_right;
+  g_angle_timeout = timed_out;
+  g_angle_state = ANGLE8_STATE_DONE;
+}
+#endif
+
 void Robot_UserSetup(void)
 {
   /* 先初始化调试串口，方便初始化失败时看到提示。 */
@@ -150,13 +228,15 @@ void Robot_UserSetup(void)
   g_turn_diff_right = 0;
 #endif
 
-#if (ROBOT_TEST_MODE == 7U)
+#if ((ROBOT_TEST_MODE == 7U) || (ROBOT_TEST_MODE == 8U))
   /* AD0 不接时地址是 0x68。初始化失败时直接停在提示信息这里。 */
   g_gyro_raw_z = 0;
   g_gyro_bias_z_raw = 0.0f;
   g_gyro_rate_z_dps = 0.0f;
   g_gyro_angle_z_deg = 0.0f;
   g_gyro_read_ok = 0U;
+
+  BSP_TimeInit();
 
   if (MPU6050_Init() == 0U)
   {
@@ -181,6 +261,35 @@ void Robot_UserSetup(void)
 
   Debug_Printf("GYRO calib done bias_raw_x100=%ld\r\n",
                (long)(g_gyro_bias_z_raw * 100.0f));
+  g_gyro_last_us = BSP_GetUs16();
+
+#if (ROBOT_TEST_MODE == 8U)
+  g_angle_state = ANGLE8_STATE_WAIT_START;
+  g_angle_elapsed_ms = 0U;
+  g_angle_settle_count = 0U;
+  g_angle_timeout = 0U;
+  g_angle_start_left = 0;
+  g_angle_start_right = 0;
+  g_angle_end_left = 0;
+  g_angle_end_right = 0;
+  g_angle_diff_left = 0;
+  g_angle_diff_right = 0;
+  g_angle_error_deg = ANGLE_TEST_TARGET_DEG;
+  g_angle_output_counts_s = 0.0f;
+  g_angle_gyro_sign = ANGLE_TEST_GYRO_SIGN;
+  g_angle_sign_corrected = 0U;
+
+  PID_Init(&g_angle_pid,
+           ANGLE_PID_KP,
+           ANGLE_PID_KI,
+           ANGLE_PID_KD,
+           ANGLE_PID_OUTPUT_MIN,
+           ANGLE_PID_OUTPUT_MAX,
+           ANGLE_PID_INTEGRAL_MIN,
+           ANGLE_PID_INTEGRAL_MAX);
+  PID_SetIntegralSeparation(&g_angle_pid,
+                            ANGLE_PID_INTEGRAL_SEPARATION_RATIO);
+#endif
 #endif
 }
 
@@ -313,6 +422,12 @@ void Robot_UserLoop(void)
     int16_t gyro_x;
     int16_t gyro_y;
     int16_t gyro_z;
+    uint16_t now_us;
+    uint16_t dt_us;
+
+    now_us = BSP_GetUs16();
+    dt_us = (uint16_t)(now_us - g_gyro_last_us);
+    g_gyro_last_us = now_us;
 
     if (MPU6050_ReadGyroRaw(&gyro_x, &gyro_y, &gyro_z) != 0U)
     {
@@ -320,7 +435,8 @@ void Robot_UserLoop(void)
       g_gyro_raw_z = gyro_z;
       g_gyro_rate_z_dps =
           ((float)gyro_z - g_gyro_bias_z_raw) / MPU6050_GYRO_LSB_PER_DPS;
-      g_gyro_angle_z_deg += g_gyro_rate_z_dps * GYRO_TEST_DT_S;
+      g_gyro_angle_z_deg +=
+          g_gyro_rate_z_dps * ((float)dt_us / 1000000.0f);
     }
     else
     {
@@ -328,8 +444,145 @@ void Robot_UserLoop(void)
     }
   }
 
+#elif (ROBOT_TEST_MODE == 8U)
+  /* 模式 8：角度外环 + 左右轮速度内环，转到指定角度后停住。 */
+  {
+    int16_t gyro_x;
+    int16_t gyro_y;
+    int16_t gyro_z;
+    uint16_t now_us;
+    uint16_t dt_us;
+    float dt_s;
+
+    now_us = BSP_GetUs16();
+    dt_us = (uint16_t)(now_us - g_gyro_last_us);
+    dt_s = (float)dt_us / 1000000.0f;
+    g_gyro_last_us = now_us;
+
+    if (MPU6050_ReadGyroRaw(&gyro_x, &gyro_y, &gyro_z) != 0U)
+    {
+      g_gyro_read_ok = 1U;
+      g_gyro_raw_z = gyro_z;
+      g_gyro_rate_z_dps =
+          ((float)gyro_z - g_gyro_bias_z_raw) / MPU6050_GYRO_LSB_PER_DPS;
+      /* 外环使用陀螺仪积分角度，符号由 ANGLE_TEST_GYRO_SIGN 修正。 */
+      g_gyro_angle_z_deg +=
+          g_gyro_rate_z_dps * g_angle_gyro_sign * dt_s;
+    }
+    else
+    {
+      g_gyro_read_ok = 0U;
+      Angle8_Finish(1U);
+    }
+
+    if (g_gyro_read_ok != 0U)
+    {
+      if (g_angle_state == ANGLE8_STATE_WAIT_START)
+      {
+        Robot_UpdateEncoders(&g_robot, ROBOT_CONTROL_PERIOD_MS);
+        g_angle_elapsed_ms += (uint32_t)((dt_us + 999U) / 1000U);
+        if (g_angle_elapsed_ms >= ANGLE_TEST_START_DELAY_MS)
+        {
+          g_gyro_angle_z_deg = 0.0f;
+          g_angle_error_deg = ANGLE_TEST_TARGET_DEG;
+          g_angle_elapsed_ms = 0U;
+          g_angle_settle_count = 0U;
+          PID_Reset(&g_angle_pid);
+          g_angle_start_left = Encoder_GetTotal(&g_robot.left_encoder);
+          g_angle_start_right = Encoder_GetTotal(&g_robot.right_encoder);
+          g_angle_state = ANGLE8_STATE_TURNING;
+        }
+      }
+      else if (g_angle_state == ANGLE8_STATE_TURNING)
+      {
+        float left_target;
+        float right_target;
+
+        g_angle_error_deg = ANGLE_TEST_TARGET_DEG - g_gyro_angle_z_deg;
+        g_angle_output_counts_s = PID_Update(&g_angle_pid,
+                                              ANGLE_TEST_TARGET_DEG,
+                                              g_gyro_angle_z_deg,
+                                              dt_s);
+
+        /* 正输出让左轮反向、右轮正向，从而原地左转。 */
+        /* 限制速度差，保证两轮目标速度都为正数。 */
+        if (g_angle_output_counts_s > ANGLE_TEST_MAX_DIFF_COUNTS_S)
+        {
+          g_angle_output_counts_s = ANGLE_TEST_MAX_DIFF_COUNTS_S;
+        }
+        else if (g_angle_output_counts_s < -ANGLE_TEST_MAX_DIFF_COUNTS_S)
+        {
+          g_angle_output_counts_s = -ANGLE_TEST_MAX_DIFF_COUNTS_S;
+        }
+
+        /* 角度朝目标的反方向增长说明陀螺仪初始符号接反。 */
+        /* 在偏差还小时自动翻转一次，避免越转越远直到超时。 */
+        if ((g_angle_sign_corrected == 0U) &&
+            (ANGLE_TEST_TARGET_DEG > 0.0f) &&
+            (g_angle_elapsed_ms < ANGLE_TEST_SIGN_CHECK_MS) &&
+            (g_gyro_angle_z_deg < -ANGLE_TEST_SIGN_FIX_DEG) &&
+            (g_angle_output_counts_s > 0.0f))
+        {
+          g_gyro_angle_z_deg = -g_gyro_angle_z_deg;
+          g_angle_gyro_sign = -g_angle_gyro_sign;
+          g_angle_sign_corrected = 1U;
+          PID_Reset(&g_angle_pid);
+          g_angle_error_deg = ANGLE_TEST_TARGET_DEG - g_gyro_angle_z_deg;
+        }
+        else if ((g_angle_sign_corrected == 0U) &&
+                 (ANGLE_TEST_TARGET_DEG < 0.0f) &&
+                 (g_angle_elapsed_ms < ANGLE_TEST_SIGN_CHECK_MS) &&
+                 (g_gyro_angle_z_deg > ANGLE_TEST_SIGN_FIX_DEG) &&
+                 (g_angle_output_counts_s < 0.0f))
+        {
+          g_gyro_angle_z_deg = -g_gyro_angle_z_deg;
+          g_angle_gyro_sign = -g_angle_gyro_sign;
+          g_angle_sign_corrected = 1U;
+          PID_Reset(&g_angle_pid);
+          g_angle_error_deg = ANGLE_TEST_TARGET_DEG - g_gyro_angle_z_deg;
+        }
+
+        /* 正输出让左轮减速、右轮加速，两轮都保持正转。 */
+        left_target = ANGLE_TEST_BASE_COUNTS_S -
+                      ANGLE_TEST_STEERING_SIGN * g_angle_output_counts_s;
+        right_target = ANGLE_TEST_BASE_COUNTS_S +
+                       ANGLE_TEST_STEERING_SIGN * g_angle_output_counts_s;
+        Robot_UpdateSpeedControl(&g_robot,
+                                 left_target,
+                                 right_target,
+                                 ROBOT_CONTROL_PERIOD_MS);
+
+        g_angle_elapsed_ms += (uint32_t)((dt_us + 999U) / 1000U);
+        if ((Angle8_Abs(g_angle_error_deg) <= ANGLE_TEST_TOLERANCE_DEG) &&
+            (Angle8_Abs(g_gyro_rate_z_dps) <= ANGLE_TEST_STOP_RATE_DPS))
+        {
+          g_angle_settle_count++;
+        }
+        else
+        {
+          g_angle_settle_count = 0U;
+        }
+
+        if (g_angle_settle_count >= ANGLE_TEST_SETTLE_COUNT)
+        {
+          Angle8_Finish(0U);
+        }
+        else if (Angle8_Abs(g_gyro_angle_z_deg) >
+                 (Angle8_Abs(ANGLE_TEST_TARGET_DEG) + ANGLE_TEST_MAX_OVERSHOOT_DEG))
+        {
+          /* 转得远超过目标角度，立即停车，避免继续绕圈。 */
+          Angle8_Finish(1U);
+        }
+        else if (g_angle_elapsed_ms >= ANGLE_TEST_MAX_MS)
+        {
+          Angle8_Finish(1U);
+        }
+      }
+    }
+  }
+
 #else
-#error "ROBOT_TEST_MODE must be 1, 2, 3, 4, 5, 6, or 7"
+#error "ROBOT_TEST_MODE must be 1, 2, 3, 4, 5, 6, 7, or 8"
 #endif
 
   if ((g_loop_count % 10U) == 0U)
@@ -344,7 +597,7 @@ void Robot_UserLoop(void)
 #elif (ROBOT_TEST_MODE == 2U)
     Debug_Printf("MOTOR Lcmd=%d Rcmd=%d\r\n",
                  (int)Motor_GetCommand(&g_robot.left_motor),
-                 (int)Motor_GetCommand(&g_robot.right_motor));
+                 (int)Motor_GetCommand(&g_robot.right_motor),
 #elif (ROBOT_TEST_MODE == 3U)
     Debug_Printf("PID Ltarget=%d Lspeed=%ld Lpwm=%d Rt=%d Rs=%ld Rpwm=%d\r\n",
                  (int)g_robot.left_target_counts_s,
@@ -390,6 +643,18 @@ void Robot_UserLoop(void)
     {
       BSP_UART_SendString("GYRO read failed.\r\n");
     }
+#elif (ROBOT_TEST_MODE == 8U)
+    Debug_Printf("A8 yaw_x10=%ld err_x10=%ld rate_x100=%ld out=%d Ls=%ld Rs=%ld Lp=%d Rp=%d done=%u to=%u\r\n",
+                 (long)(g_gyro_angle_z_deg * 10.0f),
+                 (long)(g_angle_error_deg * 10.0f),
+                 (long)(g_gyro_rate_z_dps * 100.0f),
+                 (int)g_angle_output_counts_s,
+                 (long)g_robot.left_encoder.speed_counts_s,
+                 (long)g_robot.right_encoder.speed_counts_s,
+                 (int)g_robot.left_command,
+                 (int)g_robot.right_command,
+                 (unsigned int)(g_angle_state == ANGLE8_STATE_DONE),
+                 (unsigned int)g_angle_timeout);
 #endif
   }
 
